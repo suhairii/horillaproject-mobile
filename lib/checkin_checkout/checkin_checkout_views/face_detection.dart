@@ -227,10 +227,20 @@ class _FaceScannerState extends State<FaceScanner> with SingleTickerProviderStat
           });
           if (!_isCameraInitialized) _initializeCamera();
         }
+      } else {
+        // Handle jika gambar tidak ditemukan (404) atau error lain
+        if (mounted && !hasCache) {
+           setState(() => _isFetchingImage = false);
+           showImageAlertDialog(context);
+        }
       }
       ioClient.close();
     } catch (e) {
       debugPrint("⚠️ Sync Gagal (Tetap pakai Cache): $e");
+      if (mounted && !hasCache) {
+         setState(() => _isFetchingImage = false);
+         showImageAlertDialog(context);
+      }
     }
   }
 
@@ -254,30 +264,104 @@ class _FaceScannerState extends State<FaceScanner> with SingleTickerProviderStat
     return null;
   }
 
+  bool _isRegistrationMode = false; // Add this state variable
+
+  // ... (existing initState and other methods)
+
   void showImageAlertDialog(BuildContext context) {
     showDialog(
       context: context,
       barrierDismissible: false, 
       builder: (ctx) => AlertDialog(
         title: const Text("Face Data Missing"),
-        content: const Text("Please connect to internet once to download face data."),
+        content: const Text("Your face data is not registered. Please register your face now."),
         actions: [
+          TextButton(
+            onPressed: () {
+               Navigator.of(ctx).pop();
+               setState(() {
+                 _isRegistrationMode = true; // Enable registration mode
+                 _isFetchingImage = false;
+                 _isComparing = false;
+               });
+               if (!_isCameraInitialized) _initializeCamera();
+            },
+            child: const Text("Register Now"),
+          ),
           TextButton(
             onPressed: () {
                Navigator.of(ctx).pop();
                Navigator.of(context).pop(); 
             },
-            child: const Text("OK"),
+            child: const Text("Cancel"),
           ),
         ],
       ),
     );
   }
 
+  Future<void> _registerFace() async {
+    if (!_controller.cameraController.value.isInitialized) return;
+    
+    try {
+      final image = await _controller.captureImage();
+      if (image == null) return;
+
+      setState(() => _isFetchingImage = true); // Show loading
+
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString("token");
+      final typedServerUrl = prefs.getString("typed_url");
+      
+      final uri = Uri.parse('$typedServerUrl/api/facedetection/setup/');
+      var request = http.MultipartRequest('POST', uri);
+      request.headers['Authorization'] = 'Bearer $token';
+      request.files.add(await http.MultipartFile.fromPath('image', image.path));
+
+      var response = await request.send();
+
+      if (response.statusCode == 201 || response.statusCode == 200) {
+         // Parse response to get new image URL
+         final respStr = await response.stream.bytesToString();
+         final respJson = jsonDecode(respStr);
+         
+         if (respJson['image'] != null) {
+            String newImagePath = respJson['image'].toString();
+            await prefs.setString("face_detection_image", newImagePath);
+            debugPrint("✅ New Face Image Registered: $newImagePath");
+         }
+
+         // Success! Refresh data
+         await _fetchBiometricImage(); 
+         setState(() {
+            _isRegistrationMode = false;
+         });
+         ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Face registered successfully!"), backgroundColor: Colors.green)
+         );
+      } else {
+         final respStr = await response.stream.bytesToString();
+         ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Registration failed: ${response.statusCode} $respStr"), backgroundColor: Colors.red)
+         );
+         setState(() => _isFetchingImage = false);
+      }
+
+    } catch (e) {
+      debugPrint("Registration error: $e");
+      ScaffoldMessenger.of(context).showSnackBar(
+         SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red)
+      );
+      setState(() => _isFetchingImage = false);
+    }
+  }
+
   Future<void> _startRealTimeFaceDetection() async {
     while (_isCameraInitialized && !_isDetectionPaused && mounted) {
       try {
         await Future.delayed(const Duration(milliseconds: 500)); 
+
+        if (_isRegistrationMode) continue; // Skip detection if registering
 
         if (!mounted || !_controller.cameraController.value.isInitialized) break;
 
@@ -602,6 +686,17 @@ class _FaceScannerState extends State<FaceScanner> with SingleTickerProviderStat
                 // STATUS BADGE
                 if (_isFetchingImage)
                    const CircularProgressIndicator()
+                else if (_isRegistrationMode)
+                   ElevatedButton.icon(
+                      onPressed: _registerFace,
+                      icon: const Icon(Icons.camera_alt),
+                      label: const Text("Capture & Register Face"),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 15),
+                      ),
+                   )
                 else if (_employeeImageBase64 != null)
                    Container(
                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
